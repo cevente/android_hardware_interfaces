@@ -17,6 +17,7 @@
 #include "HalProxyCallback.h"
 
 #include <cinttypes>
+#include <mutex>
 
 namespace android {
 namespace hardware {
@@ -25,6 +26,12 @@ namespace V2_0 {
 namespace implementation {
 
 static constexpr int32_t kBitsAfterSubHalIndex = 24;
+
+// NEW: Proximity rate limiting globals
+static std::mutex gProximityMutex;
+static int64_t gLastProximityEventTime = 0;
+static float gLastProximityValue = -1.0f;
+static constexpr int64_t kProximityEventMinIntervalNs = 500000000LL; // 500ms
 
 /**
  * Set the subhal index as first byte of sensor handle and return this modified version.
@@ -72,8 +79,31 @@ std::vector<V2_1::Event> HalProxyCallbackBase::processEvents(const std::vector<V
             event.u.dynamic.sensorHandle =
                     setSubHalIndex(event.u.dynamic.sensorHandle, mSubHalIndex);
         }
-        eventsOut.push_back(event);
+        
         const V2_1::SensorInfo& sensor = mCallback->getSensorInfo(event.sensorHandle);
+        
+        // NEW: Rate-limit proximity events
+        if (sensor.type == V2_1::SensorType::PROXIMITY) {
+            std::lock_guard<std::mutex> lock(gProximityMutex);
+            int64_t now = getTimeNow();
+            
+            // Skip if too frequent
+            if (now - gLastProximityEventTime < kProximityEventMinIntervalNs) {
+                ALOGV("Dropping proximity event - rate limited");
+                continue;
+            }
+            
+            // Skip if value hasn't changed
+            if (event.u.scalar == gLastProximityValue && gLastProximityValue >= 0) {
+                ALOGV("Dropping proximity event - no change");
+                continue;
+            }
+            
+            gLastProximityEventTime = now;
+            gLastProximityValue = event.u.scalar;
+        }
+        
+        eventsOut.push_back(event);
         if ((sensor.flags & V1_0::SensorFlagBits::WAKE_UP) != 0) {
             (*numWakeupEvents)++;
         }
