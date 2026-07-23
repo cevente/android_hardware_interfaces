@@ -141,6 +141,13 @@ class HalProxy : public V2_0::implementation::IScopedWakelockRefCounter,
 
     void decrementRefCountAndMaybeReleaseWakelock(size_t delta, int64_t timeoutStart = -1) override;
 
+    // NEW: Suspend/Resume handling
+    void onSuspend();
+    void onResume();
+    bool canSuspend() const;
+    void releaseAllWakelocks();
+    void setSuspendMode(bool suspend);
+
     const std::map<int32_t, SensorInfo>& getSensors() { return mSensors; }
 
   private:
@@ -230,6 +237,12 @@ class HalProxy : public V2_0::implementation::IScopedWakelockRefCounter,
 
     //! The bool indicating whether to end the threads started in initialize
     std::atomic_bool mThreadsRun = true;
+
+    // NEW: Suspend handling
+    std::atomic<bool> mSuspendMode{false};
+    std::mutex mSuspendMutex;
+    std::atomic<int64_t> mLastSensorActivity{0};
+    static constexpr int64_t kSensorIdleTimeoutNs = 5000000000LL; // 5 seconds
 
     //! The mutex protecting access to the dynamic sensors added and removed methods.
     std::mutex mDynamicSensorsMutex;
