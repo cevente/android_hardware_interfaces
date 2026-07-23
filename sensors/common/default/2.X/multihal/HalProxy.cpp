@@ -115,6 +115,53 @@ HalProxy::~HalProxy() {
     stopThreads();
 }
 
+// NEW: Suspend/Resume implementation
+void HalProxy::onSuspend() {
+    std::lock_guard<std::mutex> lock(mSuspendMutex);
+    ALOGD("System entering suspend - releasing sensor wakelocks");
+    mSuspendMode = true;
+    releaseAllWakelocks();
+    
+    // Flush any pending events
+    std::lock_guard<std::mutex> queueLock(mEventQueueWriteMutex);
+    while (!mPendingWriteEventsQueue.empty()) {
+        mPendingWriteEventsQueue.pop();
+    }
+    mSizePendingWriteEventsQueue = 0;
+}
+
+void HalProxy::onResume() {
+    std::lock_guard<std::mutex> lock(mSuspendMutex);
+    ALOGD("System resuming from suspend");
+    mSuspendMode = false;
+}
+
+bool HalProxy::canSuspend() const {
+    if (mSuspendMode) return false;
+    int64_t now = getTimeNow();
+    if (now - mLastSensorActivity.load() < kSensorIdleTimeoutNs) {
+        return false;
+    }
+    return true;
+}
+
+void HalProxy::releaseAllWakelocks() {
+    std::lock_guard<std::recursive_mutex> lock(mWakelockMutex);
+    if (mWakelockRefCount > 0) {
+        release_wake_lock(kWakelockName);
+        mWakelockRefCount = 0;
+        ALOGD("Released all sensor wakelocks");
+    }
+}
+
+void HalProxy::setSuspendMode(bool suspend) {
+    if (suspend) {
+        onSuspend();
+    } else {
+        onResume();
+    }
+}
+
 Return<void> HalProxy::getSensorsList_2_1(ISensorsV2_1::getSensorsList_2_1_cb _hidl_cb) {
     std::vector<V2_1::SensorInfo> sensors;
     for (const auto& iter : mSensors) {
@@ -279,6 +326,19 @@ Return<Result> HalProxy::batch(int32_t sensorHandle, int64_t samplingPeriodNs,
     if (!isSubHalIndexValid(sensorHandle)) {
         return Result::BAD_VALUE;
     }
+    
+    // NEW: Limit proximity sensor sampling rate
+    auto it = mSensors.find(sensorHandle);
+    if (it != mSensors.end() && it->second.type == SensorType::PROXIMITY) {
+        if (samplingPeriodNs < 500000000LL) { // 500ms
+            samplingPeriodNs = 500000000LL;
+            ALOGV("Limited proximity sensor sampling rate to 500ms");
+        }
+        if (maxReportLatencyNs < 1000000000LL) { // 1 second
+            maxReportLatencyNs = 1000000000LL;
+        }
+    }
+    
     return getSubHalForSensorHandle(sensorHandle)
             ->batch(clearSubHalIndex(sensorHandle), samplingPeriodNs, maxReportLatencyNs);
 }
@@ -363,12 +423,12 @@ Return<void> HalProxy::debug(const hidl_handle& fd, const hidl_vec<hidl_string>&
     stream << "===HalProxy===" << std::endl;
     stream << "Internal values:" << std::endl;
     stream << "  Threads are running: " << (mThreadsRun.load() ? "true" : "false") << std::endl;
+    stream << "  Suspend mode: " << (mSuspendMode.load() ? "true" : "false") << std::endl;
     int64_t now = getTimeNow();
     stream << "  Wakelock timeout start time: " << msFromNs(now - mWakelockTimeoutStartTime)
            << " ms ago" << std::endl;
     stream << "  Wakelock timeout reset time: " << msFromNs(now - mWakelockTimeoutResetTime)
            << " ms ago" << std::endl;
-    // TODO(b/142969448): Add logging for history of wakelock acquisition per subhal.
     stream << "  Wakelock ref count: " << mWakelockRefCount << std::endl;
     stream << "  # of events on pending write writes queue: " << mSizePendingWriteEventsQueue
            << std::endl;
@@ -415,7 +475,6 @@ Return<void> HalProxy::onDynamicSensorsConnected(const hidl_vec<SensorInfo>& dyn
 
 Return<void> HalProxy::onDynamicSensorsDisconnected(
         const hidl_vec<int32_t>& dynamicSensorHandlesRemoved, int32_t subHalIndex) {
-    // TODO(b/143302327): Block this call until all pending events are flushed from queue
     std::vector<int32_t> sensorHandles;
     {
         std::lock_guard<std::mutex> lock(mDynamicSensorsMutex);
@@ -570,8 +629,6 @@ void HalProxy::startPendingWritesThread(HalProxy* halProxy) {
 }
 
 void HalProxy::handlePendingWrites() {
-    // TODO(b/143302327): Find a way to optimize locking strategy maybe using two mutexes instead of
-    // one.
     std::unique_lock<std::mutex> lock(mEventQueueWriteMutex);
     while (mThreadsRun.load()) {
         mEventQueueWriteCV.wait(
@@ -601,8 +658,6 @@ void HalProxy::handlePendingWrites() {
             lock.lock();
             mSizePendingWriteEventsQueue -= numToWrite;
             if (pendingWriteEvents.size() > eventQueueSize) {
-                // TODO(b/143302327): Check if this erase operation is too inefficient. It will copy
-                // all the events ahead of it down to fill gap off array at front after the erase.
                 pendingWriteEvents.erase(pendingWriteEvents.begin(),
                                          pendingWriteEvents.begin() + eventQueueSize);
             } else {
@@ -635,6 +690,11 @@ void HalProxy::handleWakelocks() {
                     decrementRefCountAndMaybeReleaseWakelock(
                             static_cast<size_t>(numWakeLocksProcessed));
                 }
+            }
+            
+            // NEW: Release wakelock if in suspend mode
+            if (mSuspendMode.load() && mWakelockRefCount > 0) {
+                releaseAllWakelocks();
             }
         }
     }
@@ -670,8 +730,6 @@ void HalProxy::postEventsToMessageQueue(const std::vector<Event>& events, size_t
         numToWrite = std::min(events.size(), mEventQueue->availableToWrite());
         if (numToWrite > 0) {
             if (mEventQueue->write(events.data(), numToWrite)) {
-                // TODO(b/143302327): While loop if mEventQueue->avaiableToWrite > 0 to possibly fit
-                // in more writes immediately
                 mEventQueueFlag->wake(static_cast<uint32_t>(EventQueueFlagBits::READ_AND_PROCESS));
             } else {
                 numToWrite = 0;
@@ -693,6 +751,13 @@ void HalProxy::postEventsToMessageQueue(const std::vector<Event>& events, size_t
 bool HalProxy::incrementRefCountAndMaybeAcquireWakelock(size_t delta,
                                                         int64_t* timeoutStart /* = nullptr */) {
     if (!mThreadsRun.load()) return false;
+    
+    // NEW: Don't acquire wakelocks during suspend
+    if (mSuspendMode.load()) {
+        ALOGW("Attempted to acquire wakelock during suspend, ignoring");
+        return false;
+    }
+    
     std::lock_guard<std::recursive_mutex> lockGuard(mWakelockMutex);
     if (mWakelockRefCount == 0) {
         acquire_wake_lock(PARTIAL_WAKE_LOCK, kWakelockName);
@@ -703,6 +768,10 @@ bool HalProxy::incrementRefCountAndMaybeAcquireWakelock(size_t delta,
     if (timeoutStart != nullptr) {
         *timeoutStart = mWakelockTimeoutStartTime;
     }
+    
+    // NEW: Update last activity time
+    mLastSensorActivity = getTimeNow();
+    
     return true;
 }
 
@@ -717,8 +786,12 @@ void HalProxy::decrementRefCountAndMaybeReleaseWakelock(size_t delta,
     if (timeoutStart == -1) timeoutStart = mWakelockTimeoutResetTime;
     if (mWakelockRefCount == 0 || timeoutStart < mWakelockTimeoutResetTime) return;
     mWakelockRefCount -= std::min(mWakelockRefCount, delta);
+    
+    // NEW: Release immediately when count reaches 0
     if (mWakelockRefCount == 0) {
         release_wake_lock(kWakelockName);
+        ALOGV("Released sensor wakelock");
+        mWakelockTimeoutResetTime = getTimeNow();
     }
 }
 
